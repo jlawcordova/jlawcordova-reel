@@ -1,0 +1,14 @@
+[
+  ["cold-open-hook", "0:00-0:06"],
+  ["title-sting", "0:06-0:10"],
+  ["intro", "0:10-0:22"],
+  {"type": "explain", "span": "0:22-0:52", "instruments": ["guitar", "pad", "soft-bass", "shaker", "kick"]},
+  ["visual-demo", "0:52-1:08"],
+  ["sponsor", [68, 88]],
+  ["explain", "1:28-1:58"],
+  ["build", "1:58-2:04"],
+  ["reveal", "2:04-2:14"],
+  ["reflect", "2:14-2:26", ["pad", "guitar", "flute"]],
+  ["recap-cta", "2:26-2:40"],
+  ["outro-end-screen", "2:40-2:50"]
+]
