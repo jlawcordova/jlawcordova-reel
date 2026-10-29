@@ -1,0 +1,150 @@
+name: cozy-score
+
+# Checks every PR that touches the tool. Every push to main publishes a
+# rolling "cozy-score-dev" prerelease; every pushed tag (v1.2.3 or
+# cozy-score-v1.2.3) publishes a normal release for that version.
+on:
+  push:
+    branches: [main]
+    tags: ["v*", "cozy-score-v*"]
+  pull_request:
+    paths:
+      - "tooling/cozy-score/**"
+      - ".github/workflows/cozy-score.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+    working-directory: tooling/cozy-score
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal -c rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tooling/cozy-score
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --release
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tooling/cozy-score
+          key: ${{ matrix.target }}
+      # The stored hash was produced on Linux x86_64; matching it here proves
+      # the render is byte-identical across platforms.
+      - name: Cross-platform determinism
+        run: cargo test --locked --release --test determinism
+      - name: Build
+        env:
+          COZY_SCORE_BUILD: ${{ github.ref_type == 'tag' && github.ref_name || format('dev-{0}', github.sha) }}
+        run: cargo build --locked --release
+      - name: Smoke test
+        run: |
+          bin=target/release/cozy-score
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          "$bin" --version
+          "$bin" render --plan tests/fixtures/reference-short.json --out out/smoke
+          test -s out/smoke/full.wav && test -s out/smoke/no-melody.wav && test -s out/smoke/cue.json
+      - name: Package
+        run: |
+          name=cozy-score-${{ matrix.target }}
+          mkdir -p "dist/$name"
+          cp README.md "dist/$name/"
+          cp -r plans "dist/$name/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/release/cozy-score.exe "dist/$name/"
+            (cd dist && 7z a -tzip "$name.zip" "$name" > /dev/null)
+          else
+            cp target/release/cozy-score "dist/$name/"
+            tar -C dist -czf "dist/$name.tar.gz" "$name"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cozy-score-${{ matrix.target }}
+          path: |
+            tooling/cozy-score/dist/*.tar.gz
+            tooling/cozy-score/dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: cozy-score-release-${{ github.ref }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: cozy-score-*
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: Dev release (main)
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          short=${GITHUB_SHA::7}
+          gh release delete cozy-score-dev --yes --cleanup-tag || true
+          gh release create cozy-score-dev dist/* \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "cozy-score dev ($short)" \
+            --notes "Development build of cozy-score from main at $GITHUB_SHA. Replaced on every push to main; use a tagged release for anything you want to keep."
+      - name: Prod release (tag)
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$GITHUB_REF_NAME
+          want=${tag#cozy-score-}
+          want=${want#v}
+          have=$(sed -n 's/^version = "\(.*\)"/\1/p' tooling/cozy-score/Cargo.toml | head -1)
+          if [ "$want" != "$have" ]; then
+            echo "::error::tag $tag does not match Cargo.toml version $have"
+            exit 1
+          fi
+          gh release create "$tag" dist/* \
+            --verify-tag \
+            --title "cozy-score $have" \
+            --generate-notes
