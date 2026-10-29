@@ -281,7 +281,8 @@ cargo test --release
   transition selection.
 
 Rendering the 60 s reference plan takes about 3 s on a 4-core machine
-(about 5 s with `--stems`).
+(about 5 s with `--stems`). Memory grows with length: a 10-minute plan
+peaks at roughly 2.2 GB.
 
 To compare a variant against a base render sample by sample, reuse the
 base render's master gain:
@@ -296,6 +297,10 @@ cargo run --release -- render --plan variant.json --out out/variant --gain-from 
 
 ## Notes on interpretation
 
+- Speech-heavy types never carry the lead, except where the type table
+  explicitly gives one: `intro` has a few long soft lead notes and
+  `recap-cta` brings the lead back at low gain. `cold-open-hook`, `explain`
+  and `sponsor` have no lead.
 - When mallet fills the picking role it plays the same notes at 0.6× gain,
   with its own short decay instead of the guitar's long ring.
 - The plan's last end time is the length of the audio. Internal boundaries

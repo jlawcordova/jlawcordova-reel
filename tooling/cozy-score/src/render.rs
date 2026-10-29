@@ -413,6 +413,12 @@ pub fn render(req: &Request) -> Result<Rendered, Vec<String>> {
         Some(m) => (m.gain, false),
         None => {
             let pre = integrated(&full.channels(), SR);
+            if pre.is_none() {
+                warnings.push(
+                    "too short or too quiet to measure loudness (needs 400 ms); not normalised"
+                        .into(),
+                );
+            }
             let want = pre.map_or(1.0, |l| db_to_gain(TARGET_LUFS - l));
             let peak = full.peak().max(no_melody.peak());
             if peak > 0.0 && want * peak > ceiling {
