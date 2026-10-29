@@ -142,26 +142,45 @@ pub fn fits_sections(ends: &[f64], bpm: f64) -> Result<(), TooShort> {
     Err(TooShort(short))
 }
 
+/// How far a section boundary may move onto the beat before it costs as
+/// much as an event time (half the distance that earns a warning).
+pub const BOUNDARY_SLACK: f64 = 0.125;
+/// Weight of a boundary's move within the slack.
+pub const BOUNDARY_WEIGHT: f64 = 0.1;
+
+/// How far the internal boundaries move when they snap to the beat at
+/// `bpm`: squared at [`BOUNDARY_WEIGHT`], plus the part past
+/// [`BOUNDARY_SLACK`] squared in full.
+pub fn boundary_cost(ends: &[f64], bpm: f64) -> f64 {
+    let spb = 60.0 / bpm;
+    let inner = &ends[..ends.len().saturating_sub(1)];
+    inner
+        .iter()
+        .map(|&b| {
+            let d = (b - (b / spb).round() * spb).abs();
+            let past = (d - BOUNDARY_SLACK).max(0.0);
+            BOUNDARY_WEIGHT * d * d + past * past
+        })
+        .sum()
+}
+
 /// Picks the tempo (0.1 BPM steps within the feel's range) whose 1/16 grid
-/// best fits the section boundaries and the event times together (least
-/// weighted squared error, see [`grid_cost`]; ties go to the tempo nearest
-/// the middle of the range). Every section still needs at least one beat.
+/// best fits the event times (see [`grid_cost`]) while moving the section
+/// boundaries as little as it can onto the beat (see [`boundary_cost`]); ties go to the tempo nearest the middle of the
+/// range. Every section still needs at least one beat. The last end is the
+/// length of the audio and never moves.
 pub fn search_tempo_events(ends: &[f64], events: &[Anchor], feel: Feel) -> Result<f64, TooShort> {
     let (lo, hi) = feel.bpm_range();
     let steps = ((hi - lo) * 10.0).round() as i64;
     let center = feel.bpm_center();
-    let mut anchors: Vec<Anchor> = ends
-        .iter()
-        .map(|&time| Anchor { time, weight: 1.0 })
-        .collect();
-    anchors.extend_from_slice(events);
+    let anchors = events;
     let mut best: Option<(f64, f64)> = None;
     for i in 0..=steps {
         let bpm = (lo * 10.0 + i as f64) / 10.0;
         if snap_cost(ends, 60.0 / bpm).is_none() {
             continue;
         }
-        let c = grid_cost(&anchors, bpm);
+        let c = grid_cost(anchors, bpm) + boundary_cost(ends, bpm);
         let better = match best {
             None => true,
             Some((bc, bb)) => {
@@ -293,6 +312,24 @@ mod tests {
         ev.extend([0.2, 1.2, 5.95, 6.8].map(|time| Anchor { time, weight: 1.0 }));
         let bpm = search_tempo_events(&[1.2, 5.9, 7.0], &ev, Feel::Chip).unwrap();
         assert!((bpm - 150.0).abs() < 1e-9, "{bpm}");
+    }
+
+    #[test]
+    fn events_never_drag_a_boundary_far_off_the_beat() {
+        // 92 BPM puts 4 s 0.087 s from a beat; 97.5 would move it 0.308 s,
+        // for a hit that fits a sixteenth slightly better.
+        let bpm = search_tempo_events(
+            &[4.0, 8.0],
+            &[Anchor {
+                time: 6.0,
+                weight: 1.0,
+            }],
+            Feel::Spring,
+        )
+        .unwrap();
+        let spb = 60.0 / bpm;
+        let moved = (4.0 - (4.0 / spb).round() * spb).abs();
+        assert!(moved <= BOUNDARY_SLACK, "{bpm}: {moved}");
     }
 
     #[test]

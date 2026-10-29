@@ -774,3 +774,37 @@ fn the_backbeat_falls_back_between_clap_and_rim() {
         assert_eq!(all[0].binding(Role::Backbeat), Some(want));
     }
 }
+
+#[test]
+fn an_unpitched_tick_that_falls_back_keeps_a_pitch() {
+    let text = r#"{"bpm": 120, "sections": [["visual-demo", "0:00-0:04"]],
+                   "events": [{"kind": "ticks", "times": [1, 1.5, 2], "sound": "clap"}]}"#;
+    let p = planned(text);
+    let v = event_voices(&p.realized.notes, &p.arrangement, &|_| {
+        Instrument::CLASSIC.to_vec()
+    });
+    for v in v.iter().flatten() {
+        assert_eq!(v.instrument, Instrument::Mallet);
+        assert!(v.midi >= 80, "{}", v.midi);
+    }
+}
+
+#[test]
+fn run_times_must_sit_between_start_and_land() {
+    let errs = parse(
+        r#"{"sections": [["visual-demo", "0:00-0:10"]], "events": [
+          {"kind": "run", "start": 2, "times": [1, 3]},
+          {"kind": "run", "start": 0, "times": [5, 6], "land": 3}
+        ]}"#,
+    )
+    .unwrap_err()
+    .join("\n");
+    assert!(
+        errs.contains("event 1 (run): times must not start before start"),
+        "{errs}"
+    );
+    assert!(
+        errs.contains("event 2 (run): the first of times must come before land"),
+        "{errs}"
+    );
+}

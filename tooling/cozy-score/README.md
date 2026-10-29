@@ -269,11 +269,13 @@ are off by default.
 
 ### How events fit the music
 
-- **Tempo:** without `bpm`, the tempo search looks at the section
-  boundaries *and* the event times (`ticks` count four times as much), and
-  picks the tempo in the feel's range whose 1/16 grid fits them best. Each
-  distance counts at most 15 ms, since a time further off stays exact
-  anyway. The reference plan's ticks fit 150 BPM exactly.
+- **Tempo:** without `bpm`, the tempo search picks the tempo in the
+  feel's range whose 1/16 grid best fits the event times (`ticks` count four
+  times as much; each distance counts at most 15 ms, since a time further
+  off stays exact anyway), while moving the section boundaries as little as
+  it can onto the beat: a move counts at a tenth of an event's weight up to
+  0.125 s, and in full beyond. The reference plan's ticks fit 150 BPM
+  exactly.
 - **Instruments:** each sound uses the allow-list of the section it falls
   in, through roles: runs and hits use **motif**, ticks **fx**, swells
   **riser**. A sound nothing can play is skipped and listed in `cue.json`.

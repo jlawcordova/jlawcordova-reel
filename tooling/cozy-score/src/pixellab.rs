@@ -1174,6 +1174,14 @@ pub fn draft_from_sequence(d: &SequenceDraft) -> Result<Value, Vec<String>> {
         return Err(errors);
     }
 
+    // A join without a transition reads as a cut, as pixellab reads it.
+    let cut = Transition {
+        kind: "cut".into(),
+        length: 0.0,
+        direction: "left".into(),
+        gap: 0.0,
+    };
+    let join = |i: usize| seq.transitions.get(i).unwrap_or(&cut);
     // Sections: one per shot; an overlap splits at its midpoint, a blocks
     // gap belongs to the following shot.
     let mut starts = vec![0.0; n];
@@ -1206,7 +1214,7 @@ pub fn draft_from_sequence(d: &SequenceDraft) -> Result<Value, Vec<String>> {
         let why = if i == 0 {
             "starts the sequence".to_string()
         } else {
-            let t = &seq.transitions[i - 1];
+            let t = join(i - 1);
             match t.kind.as_str() {
                 "fade" | "dip" | "slide" | "wipe" => format!(
                     "starts at the midpoint of the {} ms {} overlap ({}-{} ms)",
@@ -1252,12 +1260,30 @@ pub fn draft_from_sequence(d: &SequenceDraft) -> Result<Value, Vec<String>> {
             )));
         }
         if i + 1 < n {
-            let t = &seq.transitions[i];
+            let t = join(i);
             let join = sp[i + 1].start;
+            let overlap = sp[i].end - sp[i + 1].start;
+            if t.overlaps() && overlap < 1.0 {
+                notes.push(Value::String(format!(
+                    "No sound for the {} after shot {}: it overlaps the shots by {overlap} ms.",
+                    t.kind,
+                    i + 1
+                )));
+                continue;
+            }
             match t.kind.as_str() {
                 "blocks" => {
                     let s = settled[i].unwrap_or(0.0);
                     let at = sp[i].start + seq.shots[i].length + seq.shots[i].hold - s;
+                    if at < sp[i].start {
+                        errors.push(format!(
+                            "shot {}: {}'s entrance takes {s} ms, longer than the shot and its hold ({} ms), so its exit before the blocks join can't fit",
+                            i + 1,
+                            seq.shots[i].scene,
+                            seq.shots[i].length + seq.shots[i].hold
+                        ));
+                        continue;
+                    }
                     events.push(
                         serde_json::json!({"kind": "exit", "from": from_of[i], "at": secs(at)}),
                     );
@@ -1307,6 +1333,9 @@ pub fn draft_from_sequence(d: &SequenceDraft) -> Result<Value, Vec<String>> {
                 _ => {}
             }
         }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
     }
     let mut plan = Map::new();
     if let Some(f) = d.feel {

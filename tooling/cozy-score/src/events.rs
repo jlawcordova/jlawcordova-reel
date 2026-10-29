@@ -601,6 +601,7 @@ fn parse_run(o: &Obj, errors: &mut Vec<String>) -> Option<RunSpec> {
     if !o.has("start") {
         errors.push(format!("{}: needs a start", o.ctx));
     }
+    let land = o.time("land", errors);
     let (has_count, has_step, has_end, has_times) =
         (o.has("count"), o.has("step"), o.has("end"), o.has("times"));
     if has_times && (has_count || has_step || has_end) {
@@ -622,6 +623,19 @@ fn parse_run(o: &Obj, errors: &mut Vec<String>) -> Option<RunSpec> {
         }
         if t.windows(2).any(|w| w[1] < w[0]) {
             errors.push(format!("{}: times must not go backwards", o.ctx));
+        }
+        if let (Some(s), Some(&first)) = (start, t.first()) {
+            if first < s {
+                errors.push(format!("{}: times must not start before start", o.ctx));
+            }
+        }
+        if let (Some(l), Some(&first)) = (land, t.first()) {
+            if first >= l {
+                errors.push(format!(
+                    "{}: the first of times must come before land",
+                    o.ctx
+                ));
+            }
         }
         RunTiming::Times(t)
     } else if has_step {
@@ -677,7 +691,6 @@ fn parse_run(o: &Obj, errors: &mut Vec<String>) -> Option<RunSpec> {
             }
         }
     });
-    let land = o.time("land", errors);
     if let (Some(s), Some(l)) = (start, land) {
         if l <= s {
             errors.push(format!("{}: land must be after start", o.ctx));
@@ -1315,7 +1328,7 @@ fn run_times(r: &RunSpec, spb: f64) -> (Vec<f64>, Option<(f64, f64)>) {
             let first = times[0];
             let old = run_step(r, &times, spb).unwrap_or(0.0);
             if times.len() == 1 {
-                times[0] = first.min(land - 0.05);
+                times[0] = first.min(land - 0.05).max(0.0);
             } else {
                 // Keep the shape; the landing becomes the next step.
                 let span = last - first;
@@ -1832,7 +1845,6 @@ fn realize_ticks(
     let mut prev: Option<usize> = None;
     let n = times.len();
     let mut matched = vec![false; accents.len()];
-    let pitched = matches!(t.sound, Instrument::Blip | Instrument::Mallet);
     for (k, &time) in times.iter().enumerate() {
         let midi = match &t.pitch {
             TickPitch::Notes(ns) => ns[k % ns.len()],
@@ -1848,7 +1860,7 @@ fn realize_ticks(
             matched[a] = true;
         }
         let g = t.gain * if accent.is_some() { 1.5 } else { 1.0 };
-        let midi = if pitched { midi } else { 0 };
+        // Clap and shaker ignore the pitch, but a pitched fallback uses it.
         push(
             out,
             index,
@@ -1862,7 +1874,7 @@ fn realize_ticks(
             Art::Normal,
         );
         if accent.is_some() {
-            let m2 = if pitched { midi + 5 } else { 0 };
+            let m2 = midi + 5;
             push(
                 out,
                 index,

@@ -809,4 +809,40 @@ mod scoring {
             "{e:?}"
         );
     }
+
+    #[test]
+    fn a_sequence_without_transitions_reads_its_joins_as_cuts() {
+        let seq =
+            json!({"shots": [{"scene": "a", "length": 1000}, {"scene": "b", "length": 1000}]});
+        let plan = draft_from_sequence(&SequenceDraft {
+            sequence: &seq,
+            entrances: tmp(),
+            types: &[],
+            plan_dir: tmp(),
+            feel: None,
+        })
+        .unwrap();
+        assert_eq!(plan["events"][0]["kind"], "hit");
+        assert_eq!(plan["events"][0]["at"], 1);
+    }
+
+    #[test]
+    fn an_exit_longer_than_its_shot_is_reported() {
+        let dir = tmp().join("seq-entrances-3");
+        std::fs::create_dir_all(&dir).unwrap();
+        let settled = write_scene(&dir, "slow", 6);
+        let seq = json!({
+            "shots": [{"scene": "slow", "length": (settled as i64 - 200).max(100)}, {"scene": "slow", "length": 4000}],
+            "transitions": [{"kind": "blocks", "gap": 0}]
+        });
+        let e = draft_from_sequence(&SequenceDraft {
+            sequence: &seq,
+            entrances: &dir,
+            types: &[],
+            plan_dir: tmp(),
+            feel: None,
+        })
+        .unwrap_err();
+        assert!(e[0].contains("longer than the shot and its hold"), "{e:?}");
+    }
 }
