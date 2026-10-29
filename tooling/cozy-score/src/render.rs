@@ -1,19 +1,21 @@
 //! The render pipeline and its cue sheet.
 
 use crate::analysis::{band_levels, BandLevel};
-use crate::arrange::{arrange, Arrangement, TransitionInfo};
+use crate::arrange::{arrange_with, ArrangeOptions, Arrangement, Art, NoteEvent, TransitionInfo};
 use crate::dsp::{db_to_gain, gain_to_db, StereoConvolver, SR};
-use crate::harmony::Chord;
+use crate::events::{self, EventNote, EventSpec, EventSummary, Level, RealizeContext};
+use crate::harmony::{key_name, key_shift, Key};
 use crate::loudness::{gated, integrated, k_power};
 use crate::mix::{add_voice, master_eq, reverb_ir, saturate, Bed, Stereo, WET};
 use crate::par::par_map;
 use crate::plan::SectionSpec;
 use crate::resolve::{
-    resolve_sections, summary_lines, voices, Bus, RoleUse, SectionResolution, Voice,
+    nominal, resolve_event, resolve_sections, summary_lines, transpose, voices, Bus, RoleUse,
+    SectionResolution, Voice,
 };
 use crate::synth::Synth;
-use crate::timing::{search_tempo, snap};
-use crate::types::{Feel, Instrument, VideoType};
+use crate::timing::{fits_sections, search_tempo, search_tempo_events, snap};
+use crate::types::{Feel, Instrument, Role, VideoType};
 use serde::Serialize;
 
 pub const TARGET_LUFS: f64 = -14.0;
@@ -39,6 +41,33 @@ pub struct Request<'a> {
     pub gain_from: Option<MasterRef>,
 }
 
+/// How the ending fades out.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum FadeOut {
+    /// The original rule, min(3 s, the last section): array plans that use
+    /// none of the newer options keep rendering exactly as they did.
+    #[default]
+    Legacy,
+    /// min(3 s, 0.1 x the length).
+    Auto,
+    Seconds(f64),
+}
+
+/// Everything beyond the original [`Request`]. The default renders exactly
+/// as the tool always has.
+#[derive(Clone, Debug, Default)]
+pub struct Options {
+    pub events: Vec<EventSpec>,
+    /// An exact tempo (no search).
+    pub bpm: Option<f64>,
+    pub key: Option<Key>,
+    pub fade_out: FadeOut,
+    /// Extra audio after the last section, in seconds.
+    pub tail: f64,
+    /// Frame rate for aligning entrance and exit sounds.
+    pub fps: Option<f64>,
+}
+
 pub struct Rendered {
     pub full: Stereo,
     pub no_melody: Stereo,
@@ -47,6 +76,8 @@ pub struct Rendered {
     pub cue: Cue,
     pub arrangement: Arrangement,
     pub resolution: Vec<SectionResolution>,
+    /// Every event note and the instrument that played it (None: skipped).
+    pub event_notes: Vec<(EventNote, Option<Instrument>)>,
     /// Lines for stderr: substitutions, dropped roles and warnings.
     pub notes: Vec<String>,
 }
@@ -59,14 +90,55 @@ pub struct Cue {
     pub seed: u64,
     pub feel: Feel,
     pub bpm: f64,
-    pub key: &'static str,
+    /// "searched" (sections only), "searched with events" or "given".
+    pub bpm_source: &'static str,
+    pub key: String,
+    /// Semitones from the feel's home key.
+    pub key_shift: i32,
     pub sample_rate: u32,
+    /// The plan's length (the video's).
     pub duration_s: f64,
+    pub video_duration_s: f64,
+    /// The rendered audio: the video plus `--tail`.
+    pub audio_duration_s: f64,
+    pub tail_s: f64,
+    pub fade_out_s: f64,
     pub score_instruments: Vec<Instrument>,
     pub master: MasterInfo,
     pub sections: Vec<CueSection>,
     pub transitions: Vec<TransitionInfo>,
+    pub events: Vec<CueEvent>,
     pub warnings: Vec<String>,
+}
+
+/// An event as rendered: its resolved times, every sound it made and the
+/// instrument that played it, and what was skipped.
+#[derive(Clone, Debug, Serialize)]
+pub struct CueEvent {
+    #[serde(flatten)]
+    pub summary: EventSummary,
+    pub instruments: Vec<Instrument>,
+    pub sounds: Vec<CueSound>,
+    pub skipped: Vec<CueSound>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CueSound {
+    pub time_s: f64,
+    /// Before frame alignment, when `fps` moved it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_time_s: Option<f64>,
+    pub what: &'static str,
+    /// The scene piece it is for (index into the scene's pieces).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub piece: Option<usize>,
+    pub role: Role,
+    pub section: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instrument: Option<Instrument>,
+    pub midi: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amp: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -103,7 +175,8 @@ pub struct CueSection {
     pub beats: u32,
     pub bars: usize,
     pub chord_loop: String,
-    pub chords: Vec<Chord>,
+    /// Chord names in the score's key.
+    pub chords: Vec<String>,
     pub instrument_list: &'static str,
     pub allowed_instruments: Vec<Instrument>,
     pub instruments_used: Vec<Instrument>,
@@ -115,6 +188,56 @@ pub struct CueSection {
     pub target_relative_lu: f64,
     pub trim_db: f64,
     pub bands: Vec<BandLevel>,
+}
+
+/// Binds event notes to instruments through each section's allow-list
+/// (`allowed(section)`): the instrument a note asks for when allowed, else
+/// its role's fallbacks; None when nothing can play it.
+pub fn event_voices(
+    notes: &[EventNote],
+    arr: &Arrangement,
+    allowed: &dyn Fn(usize) -> Vec<Instrument>,
+) -> Vec<Option<Voice>> {
+    let mut counters: Vec<u64> = Vec::new();
+    notes
+        .iter()
+        .map(|n| {
+            if counters.len() <= n.event {
+                counters.resize(n.event + 1, 0);
+            }
+            let k = counters[n.event];
+            counters[n.event] += 1;
+            let s = arr.section_at(n.time);
+            let sp = &arr.sections[s];
+            let inst = resolve_event(n.role, n.prefer, &allowed(s), arr.feel, sp.preferred_bass)?;
+            let art = if n.role == Role::Fx && inst == Instrument::Mallet {
+                Art::Muted
+            } else {
+                n.art
+            };
+            let amp = match n.level {
+                Level::Abs(a) => a,
+                Level::Rel(r) => r * nominal(n.role, inst),
+            };
+            Some(Voice {
+                event: NoteEvent {
+                    // Bit 63 keeps event ids apart from the arrangement's.
+                    id: (1 << 63) | ((n.event as u64) << 40) | k,
+                    section: s,
+                    role: n.role,
+                    time: n.time,
+                    dur: n.dur,
+                    midi: n.midi,
+                    gain: 1.0,
+                    art,
+                },
+                instrument: inst,
+                bus: Bus::Inst(inst),
+                midi: n.midi + transpose(n.role, inst),
+                amp,
+            })
+        })
+        .collect()
 }
 
 /// Loudness target relative to the loudest section, by energy.
@@ -324,9 +447,61 @@ pub fn calibrate_trims(arr: &Arrangement, parts: &[&[Option<Part>]], len: usize)
 }
 
 pub fn render(req: &Request) -> Result<Rendered, Vec<String>> {
+    render_with(req, &Options::default())
+}
+
+/// Seconds of fade-out for an audio of `len_s` seconds.
+fn fade_seconds(rule: FadeOut, arr: &Arrangement) -> f64 {
+    let last = arr.sections.last().expect("sections");
+    match rule {
+        FadeOut::Legacy => 3.0f64.min(arr.duration - last.start),
+        FadeOut::Auto => 3.0f64.min(0.1 * arr.duration),
+        FadeOut::Seconds(s) => s,
+    }
+}
+
+pub fn render_with(req: &Request, opts: &Options) -> Result<Rendered, Vec<String>> {
+    // A tail never changes the level: the gain and saturation come from the
+    // same render without it, so the two match up to the fade.
+    if opts.tail > 0.0 && req.gain_from.is_none() {
+        let plain = render_with(
+            req,
+            &Options {
+                tail: 0.0,
+                ..opts.clone()
+            },
+        )?;
+        let m = MasterRef {
+            gain: plain.cue.master.gain,
+            saturation_peak: plain.cue.master.saturation_peak,
+        };
+        let trims: Vec<f64> = plain.cue.sections.iter().map(|s| s.trim_db).collect();
+        drop(plain);
+        let mut r = render_inner(req, opts, Some(m), Some(trims))?;
+        r.cue.master.gain_reused = false;
+        return Ok(r);
+    }
+    render_inner(req, opts, req.gain_from, None)
+}
+
+/// `trims_from`: section trims to use instead of calibrating (the render
+/// without the tail's).
+/// Everything before audio: the tempo, the timing, the arrangement and the
+/// event notes.
+pub struct Planned {
+    pub timing: crate::timing::Timing,
+    pub bpm_source: &'static str,
+    pub shift: i32,
+    pub arrangement: Arrangement,
+    pub realized: events::Realized,
+    pub warnings: Vec<String>,
+}
+
+/// The stages before synthesis, for a request and its options.
+pub fn arrange_plan(req: &Request, opts: &Options) -> Result<Planned, Vec<String>> {
     let specs = req.specs;
     let ends: Vec<f64> = specs.iter().map(|s| s.end).collect();
-    let bpm = search_tempo(&ends, req.feel).map_err(|e| {
+    let short = |e: crate::timing::TooShort| {
         e.0.iter()
             .map(|&i| {
                 format!(
@@ -336,7 +511,18 @@ pub fn render(req: &Request) -> Result<Rendered, Vec<String>> {
                 )
             })
             .collect::<Vec<_>>()
-    })?;
+    };
+    let (bpm, bpm_source) = match opts.bpm {
+        Some(b) => {
+            fits_sections(&ends, b).map_err(short)?;
+            (b, "given")
+        }
+        None if !opts.events.is_empty() => (
+            search_tempo_events(&ends, &events::anchors(&opts.events), req.feel).map_err(short)?,
+            "searched with events",
+        ),
+        None => (search_tempo(&ends, req.feel).map_err(short)?, "searched"),
+    };
     let timing = snap(&ends, bpm);
     let mut warnings = Vec::new();
     for (i, s) in timing.sections.iter().enumerate() {
@@ -349,13 +535,80 @@ pub fn render(req: &Request) -> Result<Rendered, Vec<String>> {
         }
     }
     let kinds: Vec<VideoType> = specs.iter().map(|s| s.kind).collect();
-    let arr = arrange(&kinds, &timing, req.feel, req.seed);
+    let shift = key_shift(req.feel, opts.key);
+    // A run (or entrance) that ends or lands within a beat of a boundary
+    // replaces that boundary's automatic transition.
+    let ends_at = events::run_end_times(&opts.events, timing.spb);
+    let suppressed: Vec<usize> = (1..timing.sections.len())
+        .filter(|&j| {
+            let b = timing.sections[j].start;
+            ends_at.iter().any(|t| (t - b).abs() <= timing.spb + 1e-9)
+        })
+        .collect();
+    let arr = arrange_with(
+        &kinds,
+        &timing,
+        &ArrangeOptions {
+            feel: req.feel,
+            seed: req.seed,
+            shift,
+            flats: opts.key.is_some_and(|k| k.flats),
+            suppressed,
+        },
+    );
+    let realized = events::realize(
+        &opts.events,
+        &RealizeContext {
+            arr: &arr,
+            seed: req.seed,
+            fps: opts.fps,
+        },
+    );
+    warnings.extend(realized.warnings.iter().cloned());
+    Ok(Planned {
+        timing,
+        bpm_source,
+        shift,
+        arrangement: arr,
+        realized,
+        warnings,
+    })
+}
+
+fn render_inner(
+    req: &Request,
+    opts: &Options,
+    gain_from: Option<MasterRef>,
+    trims_from: Option<Vec<f64>>,
+) -> Result<Rendered, Vec<String>> {
+    let specs = req.specs;
+    let Planned {
+        timing,
+        bpm_source,
+        shift,
+        arrangement: arr,
+        realized,
+        mut warnings,
+    } = arrange_plan(req, opts)?;
+    let bpm = timing.bpm;
     let n = arr.sections.len();
-    let len = (arr.duration * SR).round() as usize;
-    let fade_out = {
-        let last = arr.sections.last().expect("sections");
-        3.0f64.min(arr.duration - last.start)
-    };
+    let tail = opts.tail.max(0.0);
+    let len = ((arr.duration + tail) * SR).round() as usize;
+    let audio_end = len as f64 / SR;
+    for s in &realized.summaries {
+        if realized
+            .notes
+            .iter()
+            .any(|n| n.event == s.index && n.time >= audio_end)
+        {
+            warnings.push(format!(
+                "event {} ({}): some sounds start after the end of the audio ({audio_end:.3} s) and are left out (--tail lengthens it)",
+                s.index + 1,
+                s.kind
+            ));
+        }
+    }
+    let fade_out = fade_seconds(opts.fade_out, &arr);
     let (irl, irr) = reverb_ir(req.seed);
     let reverb = StereoConvolver::new(&irl, &irr);
     let chain = Chain {
@@ -368,15 +621,19 @@ pub fn render(req: &Request) -> Result<Rendered, Vec<String>> {
     // Unrestricted render: calibrates the trims, and is the final audio
     // when the allow-lists change nothing.
     let all_res = resolve_sections(&arr, &Instrument::ALL, &vec![None; n]);
-    let all_vs = voices(&arr.events, &all_res);
+    let mut all_vs = voices(&arr.events, &all_res);
+    let all_ev = event_voices(&realized.notes, &arr, &|_| Instrument::ALL.to_vec());
+    all_vs.extend(all_ev.iter().flatten().cloned());
     let lead_u = render_parts(req.seed, &all_vs, |v| v.bus == Bus::Lead, n, &chain);
     let rest_u = render_parts(req.seed, &all_vs, |v| v.bus != Bus::Lead, n, &chain);
-    let trims = calibrate_trims(&arr, &[&rest_u, &lead_u], len);
+    let trims = trims_from.unwrap_or_else(|| calibrate_trims(&arr, &[&rest_u, &lead_u], len));
     let gains: Vec<f64> = trims.iter().map(|t| db_to_gain(*t)).collect();
 
     let own: Vec<Option<Vec<Instrument>>> = specs.iter().map(|s| s.instruments.clone()).collect();
     let res = resolve_sections(&arr, &req.instruments, &own);
-    let vs = voices(&arr.events, &res);
+    let mut vs = voices(&arr.events, &res);
+    let ev = event_voices(&realized.notes, &arr, &|s| res[s].allowed.clone());
+    vs.extend(ev.iter().flatten().cloned());
     let mut notes = summary_lines(&arr, &res);
     for r in &res {
         warnings.extend(r.warnings.iter().cloned());
@@ -386,7 +643,10 @@ pub fn render(req: &Request) -> Result<Rendered, Vec<String>> {
             .iter()
             .map(|r| r.instrument)
             .eq(b.roles.iter().map(|r| r.instrument))
-    });
+    }) && ev
+        .iter()
+        .map(|v| v.as_ref().map(|v| v.instrument))
+        .eq(all_ev.iter().map(|v| v.as_ref().map(|v| v.instrument)));
     let (lead, rest) = if unchanged {
         (lead_u, rest_u)
     } else {
@@ -402,14 +662,12 @@ pub fn render(req: &Request) -> Result<Rendered, Vec<String>> {
     sum_parts(&mut full, &lead, &gains);
     drop((lead, rest));
 
-    let sat_peak = req
-        .gain_from
-        .map_or_else(|| full.peak(), |m| m.saturation_peak);
+    let sat_peak = gain_from.map_or_else(|| full.peak(), |m| m.saturation_peak);
     saturate(&mut full, sat_peak);
     saturate(&mut no_melody, sat_peak);
 
     let ceiling = db_to_gain(PEAK_CEILING_DBFS);
-    let (gain, peak_limited) = match req.gain_from {
+    let (gain, peak_limited) = match gain_from {
         Some(m) => (m.gain, false),
         None => {
             let pre = integrated(&full.channels(), SR);
@@ -438,15 +696,29 @@ pub fn render(req: &Request) -> Result<Rendered, Vec<String>> {
             full_lufs.unwrap_or(f64::NEG_INFINITY)
         ));
     }
-    if req.gain_from.is_some() && full.peak().max(no_melody.peak()) > ceiling {
-        warnings.push("reused gain puts the peak above -1 dBFS".into());
+    if gain_from.is_some() && full.peak().max(no_melody.peak()) > ceiling {
+        warnings.push(if req.gain_from.is_some() {
+            "reused gain puts the peak above -1 dBFS".into()
+        } else {
+            "the tail's hits peak above -1 dBFS at the level of the render without the tail".into()
+        });
     }
 
     // Stems: each bus through the same linear chain and gain (no saturation,
     // which is not linear), so they line up with the full mix.
     let mut stems = Vec::new();
     if req.stems {
-        for bus in Bus::all() {
+        // The classic buses always, a newer instrument's when it plays.
+        let buses: Vec<Bus> = Bus::all()
+            .into_iter()
+            .filter(|b| match b {
+                Bus::Lead => true,
+                Bus::Inst(i) => {
+                    Instrument::CLASSIC.contains(i) || vs.iter().any(|v| v.instrument == *i)
+                }
+            })
+            .collect();
+        for bus in buses {
             let parts = render_parts(req.seed, &vs, |v| v.bus == bus, n, &chain);
             let mut st = Stereo::silent(len);
             let g: Vec<f64> = gains.iter().map(|x| x * gain).collect();
@@ -492,7 +764,11 @@ pub fn render(req: &Request) -> Result<Rendered, Vec<String>> {
                 beats: sp.beats,
                 bars: sp.bars,
                 chord_loop: sp.loop_name.clone(),
-                chords: sp.chords.clone(),
+                chords: sp
+                    .chords
+                    .iter()
+                    .map(|c| c.name_in(shift, opts.key.is_some_and(|k| k.flats)))
+                    .collect(),
                 instrument_list: r.list_source,
                 allowed_instruments: r.allowed.clone(),
                 instruments_used: r.instruments_used.clone(),
@@ -525,6 +801,66 @@ pub fn render(req: &Request) -> Result<Rendered, Vec<String>> {
         })
         .collect();
 
+    // Events: what each played and on which instrument.
+    let round6 = |x: f64| (x * 1e6).round() / 1e6;
+    let mut cue_events: Vec<CueEvent> = realized
+        .summaries
+        .iter()
+        .map(|s| CueEvent {
+            summary: s.clone(),
+            instruments: Vec::new(),
+            sounds: Vec::new(),
+            skipped: Vec::new(),
+        })
+        .collect();
+    let mut event_notes = Vec::new();
+    for (note, v) in realized.notes.iter().zip(&ev) {
+        let Some(ce) = cue_events
+            .iter_mut()
+            .find(|c| c.summary.index == note.event)
+        else {
+            continue;
+        };
+        let sound = CueSound {
+            time_s: round6(note.time),
+            sync_time_s: note.sync_time.map(round6),
+            what: note.what,
+            piece: note.piece,
+            role: note.role,
+            section: arr.section_at(note.time),
+            instrument: v.as_ref().map(|v| v.instrument),
+            midi: note.midi,
+            amp: v.as_ref().map(|v| round6(v.amp)),
+        };
+        match v {
+            Some(v) => {
+                if !ce.instruments.contains(&v.instrument) {
+                    ce.instruments.push(v.instrument);
+                }
+                ce.sounds.push(sound);
+            }
+            None => ce.skipped.push(sound),
+        }
+        event_notes.push((note.clone(), v.as_ref().map(|v| v.instrument)));
+    }
+    for ce in &mut cue_events {
+        ce.instruments.sort();
+        if !ce.skipped.is_empty() {
+            let label = format!("event {} ({})", ce.summary.index + 1, ce.summary.kind);
+            let mut whats: Vec<String> = ce
+                .skipped
+                .iter()
+                .map(|s| format!("{} ({})", s.what, s.role))
+                .collect();
+            whats.dedup();
+            warnings.push(format!(
+                "{label}: {} sound(s) skipped, no allowed instrument: {}",
+                ce.skipped.len(),
+                whats.join(", ")
+            ));
+        }
+    }
+
     notes.extend(warnings.iter().map(|w| format!("warning: {w}")));
     let cue = Cue {
         tool: "cozy-score",
@@ -533,9 +869,15 @@ pub fn render(req: &Request) -> Result<Rendered, Vec<String>> {
         seed: req.seed,
         feel: req.feel,
         bpm,
-        key: "D major",
+        bpm_source,
+        key: key_name(req.feel, shift, opts.key.is_some_and(|k| k.flats)),
+        key_shift: shift,
         sample_rate: SR as u32,
         duration_s: arr.duration,
+        video_duration_s: arr.duration,
+        audio_duration_s: len as f64 / SR,
+        tail_s: tail,
+        fade_out_s: fade_out,
         score_instruments: req.instruments.clone(),
         master: MasterInfo {
             integrated_lufs: full_lufs,
@@ -546,11 +888,12 @@ pub fn render(req: &Request) -> Result<Rendered, Vec<String>> {
             gain_db: gain_to_db(gain),
             saturation_peak: sat_peak,
             peak_limited,
-            gain_reused: req.gain_from.is_some(),
+            gain_reused: gain_from.is_some(),
             reverb_wet: WET,
         },
         sections,
         transitions: arr.transitions.clone(),
+        events: cue_events,
         warnings,
     };
     Ok(Rendered {
@@ -560,6 +903,7 @@ pub fn render(req: &Request) -> Result<Rendered, Vec<String>> {
         cue,
         arrangement: arr,
         resolution: res,
+        event_notes,
         notes,
     })
 }

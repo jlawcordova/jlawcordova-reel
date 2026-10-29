@@ -141,10 +141,17 @@ pub enum Instrument {
     Kick,
     Shaker,
     Rim,
+    Chip,
+    SynthPluck,
+    Blip,
+    Clap,
+    Riser,
 }
 
 impl Instrument {
-    pub const ALL: [Instrument; 9] = [
+    /// The instruments of the spring and summer feels, whose default
+    /// allow-list has always been exactly these.
+    pub const CLASSIC: [Instrument; 9] = [
         Instrument::Flute,
         Instrument::Guitar,
         Instrument::Mallet,
@@ -154,6 +161,23 @@ impl Instrument {
         Instrument::Kick,
         Instrument::Shaker,
         Instrument::Rim,
+    ];
+
+    pub const ALL: [Instrument; 14] = [
+        Instrument::Flute,
+        Instrument::Guitar,
+        Instrument::Mallet,
+        Instrument::Pad,
+        Instrument::HeavyBass,
+        Instrument::SoftBass,
+        Instrument::Kick,
+        Instrument::Shaker,
+        Instrument::Rim,
+        Instrument::Chip,
+        Instrument::SynthPluck,
+        Instrument::Blip,
+        Instrument::Clap,
+        Instrument::Riser,
     ];
 
     pub fn id(self) -> &'static str {
@@ -167,6 +191,11 @@ impl Instrument {
             Instrument::Kick => "kick",
             Instrument::Shaker => "shaker",
             Instrument::Rim => "rim",
+            Instrument::Chip => "chip",
+            Instrument::SynthPluck => "synth-pluck",
+            Instrument::Blip => "blip",
+            Instrument::Clap => "clap",
+            Instrument::Riser => "riser",
         }
     }
 
@@ -185,6 +214,11 @@ impl Instrument {
             Instrument::Kick => "soft pitched kick",
             Instrument::Shaker => "high-passed noise shaker",
             Instrument::Rim => "band-passed rim click",
+            Instrument::Chip => "band-limited 25% pulse lead with delayed vibrato",
+            Instrument::SynthPluck => "bright short pluck for chiptune arpeggios",
+            Instrument::Blip => "short rising sine blip for UI pops and steps",
+            Instrument::Clap => "three-burst band-passed noise clap",
+            Instrument::Riser => "high-passed noise swell (or its reverse)",
         }
     }
 
@@ -196,6 +230,10 @@ impl Instrument {
             Instrument::Mallet => 0.4,
             Instrument::Shaker => 0.25,
             Instrument::Rim => -0.15,
+            Instrument::Chip => 0.05,
+            Instrument::SynthPluck => -0.3,
+            Instrument::Blip => 0.35,
+            Instrument::Clap => -0.1,
             _ => 0.0,
         }
     }
@@ -209,6 +247,11 @@ impl Instrument {
             Instrument::Pad => 0.30,
             Instrument::Shaker => 0.12,
             Instrument::Rim => 0.15,
+            Instrument::Chip => 0.28,
+            Instrument::SynthPluck => 0.22,
+            Instrument::Blip => 0.25,
+            Instrument::Clap => 0.15,
+            Instrument::Riser => 0.12,
             _ => 0.0,
         }
     }
@@ -233,11 +276,19 @@ pub enum Role {
     Bass,
     Kick,
     Shaker,
-    Rim,
+    /// Beats 2 and 4: rim, or clap in the chip feel. Its place in this list
+    /// is part of every note id, so new roles only ever go after it.
+    Backbeat,
+    /// Small accents: ticks, pops, entrance objects.
+    Fx,
+    /// Noise swells.
+    Riser,
 }
 
 impl Role {
-    pub const ALL: [Role; 9] = [
+    pub const COUNT: usize = 11;
+
+    pub const ALL: [Role; 11] = [
         Role::Lead,
         Role::Motif,
         Role::ChordHits,
@@ -246,7 +297,9 @@ impl Role {
         Role::Bass,
         Role::Kick,
         Role::Shaker,
-        Role::Rim,
+        Role::Backbeat,
+        Role::Fx,
+        Role::Riser,
     ];
 
     pub fn id(self) -> &'static str {
@@ -259,7 +312,9 @@ impl Role {
             Role::Bass => "bass",
             Role::Kick => "kick",
             Role::Shaker => "shaker",
-            Role::Rim => "rim",
+            Role::Backbeat => "backbeat",
+            Role::Fx => "fx",
+            Role::Riser => "riser",
         }
     }
 
@@ -273,7 +328,9 @@ impl Role {
             Role::Bass => "bass line",
             Role::Kick => "kick drum",
             Role::Shaker => "shaker",
-            Role::Rim => "rim click",
+            Role::Backbeat => "beats 2 and 4",
+            Role::Fx => "ticks, pops and other small accents",
+            Role::Riser => "noise swells into and out of hits",
         }
     }
 
@@ -297,13 +354,31 @@ impl fmt::Display for Role {
 pub enum Feel {
     Spring,
     Summer,
+    Chip,
 }
 
 impl Feel {
+    pub const ALL: [Feel; 3] = [Feel::Spring, Feel::Summer, Feel::Chip];
+
     pub fn id(self) -> &'static str {
         match self {
             Feel::Spring => "spring",
             Feel::Summer => "summer",
+            Feel::Chip => "chip",
+        }
+    }
+
+    pub fn from_id(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|f| f.id() == s)
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Feel::Spring => "92-100 BPM, slow build, gritty bass, D major",
+            Feel::Summer => "116-124 BPM, four-on-the-floor, soft round bass, D major",
+            Feel::Chip => {
+                "140-160 BPM chiptune pop: 7th chords, synth-pluck, chip lead, clap, C major"
+            }
         }
     }
 
@@ -312,6 +387,16 @@ impl Feel {
         match self {
             Feel::Spring => (92.0, 100.0),
             Feel::Summer => (116.0, 124.0),
+            Feel::Chip => (140.0, 160.0),
+        }
+    }
+
+    /// The allow-list when none is given. Spring and summer keep the
+    /// instruments they have always had, so old plans sound the same.
+    pub fn default_instruments(self) -> Vec<Instrument> {
+        match self {
+            Feel::Spring | Feel::Summer => Instrument::CLASSIC.to_vec(),
+            Feel::Chip => Instrument::ALL.to_vec(),
         }
     }
 

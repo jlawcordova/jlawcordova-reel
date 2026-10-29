@@ -53,7 +53,7 @@ fn fallback_order() {
     assert_eq!(res[vd].binding(Role::ChordHits), Some(Guitar));
     assert_eq!(res[vd].binding(Role::Bass), Some(SoftBass));
     assert_eq!(res[vd].binding(Role::Kick), None);
-    assert_eq!(res[vd].binding(Role::Rim), None);
+    assert_eq!(res[vd].binding(Role::Backbeat), None);
     let res = resolve_sections(&arr, &[Mallet, Guitar, Flute], &own);
     assert_eq!(res[vd].binding(Role::Lead), Some(Flute));
     let res = resolve_sections(&arr, &[Guitar, Mallet], &own);
@@ -200,7 +200,7 @@ fn transitions_follow_energy_delta() {
     // Drums rest for the last beat before a drop.
     let drop = &arr.transitions[1];
     assert!(!arr.events.iter().any(|e| e.section == 1
-        && matches!(e.role, Role::Kick | Role::Shaker | Role::Rim)
+        && matches!(e.role, Role::Kick | Role::Shaker | Role::Backbeat)
         && e.time >= drop.time - arr.spb + 0.01
         && e.time < drop.time));
 }
