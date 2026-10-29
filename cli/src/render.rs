@@ -133,6 +133,16 @@ impl<'a> Ctx<'a> {
         assets: &'a Assets,
         settings: Settings,
     ) -> Result<Ctx<'a>, Errors> {
+        // Beats are paired by position with the timeline's, so they must be
+        // the same beats.
+        let ids = |v: Vec<&str>| v.join(",");
+        if ids(sb.beats.iter().map(|b| b.id.as_str()).collect())
+            != ids(t.beats.iter().map(|b| b.id.as_str()).collect())
+        {
+            return Err(vec![
+                "the storyboard's beats changed since the timeline was locked; run pixelreel cut unlock, then cut lock".into(),
+            ]);
+        }
         let takes = p
             .takes()?
             .takes
