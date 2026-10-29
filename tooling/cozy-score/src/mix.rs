@@ -2,9 +2,8 @@
 //! EQ, peak saturation and loudness normalisation.
 
 use crate::dsp::{Biquad, SR};
-use crate::resolve::Voice;
 use crate::rng::Rng;
-use crate::synth::Synth;
+use crate::types::Instrument;
 use core::f64::consts::PI;
 
 #[derive(Clone, Debug, Default)]
@@ -67,33 +66,23 @@ pub fn pan_gains(p: f64) -> (f64, f64) {
     (libm::cos(theta), libm::sin(theta))
 }
 
-/// Renders and sums voices in the given (deterministic) order.
-pub fn mix_voices<'a>(
-    synth: &mut Synth,
-    voices: impl Iterator<Item = &'a Voice>,
-    len: usize,
-) -> Bed {
-    let mut dry = Stereo::silent(len);
-    let mut send = vec![0.0; len];
-    for v in voices {
-        let start = (v.event.time * SR).round() as usize;
-        if start >= len || v.amp == 0.0 {
-            continue;
-        }
-        let s = synth.render(v);
-        let (gl, gr) = pan_gains(v.instrument.pan());
-        let sl = v.instrument.send();
-        let end = (start + s.len()).min(len);
-        for (k, x) in s[..end - start].iter().enumerate() {
-            let i = start + k;
-            dry.l[i] += gl * x;
-            dry.r[i] += gr * x;
-            if sl > 0.0 {
-                send[i] += sl * x;
-            }
+/// Adds one rendered note at sample `at`, panned and sent to the reverb.
+pub fn add_voice(bed: &mut Bed, at: usize, x: &[f64], inst: Instrument) {
+    let len = bed.dry.len();
+    if at >= len {
+        return;
+    }
+    let (gl, gr) = pan_gains(inst.pan());
+    let sl = inst.send();
+    let n = x.len().min(len - at);
+    for (k, v) in x[..n].iter().enumerate() {
+        let i = at + k;
+        bed.dry.l[i] += gl * v;
+        bed.dry.r[i] += gr * v;
+        if sl > 0.0 {
+            bed.send[i] += sl * v;
         }
     }
-    Bed { dry, send }
 }
 
 /// 1.9 s stereo impulse response: two seeded noise IRs with an e^{-t/0.45}

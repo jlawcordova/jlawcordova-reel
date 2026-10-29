@@ -5,7 +5,8 @@ use crate::arrange::{arrange, Arrangement, TransitionInfo};
 use crate::dsp::{db_to_gain, gain_to_db, StereoConvolver, SR};
 use crate::harmony::Chord;
 use crate::loudness::{gated, integrated, k_power};
-use crate::mix::{master_eq, mix_voices, reverb_ir, saturate, Stereo, WET};
+use crate::mix::{add_voice, master_eq, reverb_ir, saturate, Bed, Stereo, WET};
+use crate::par::par_map;
 use crate::plan::SectionSpec;
 use crate::resolve::{
     resolve_sections, summary_lines, voices, Bus, RoleUse, SectionResolution, Voice,
@@ -18,6 +19,8 @@ use serde::Serialize;
 pub const TARGET_LUFS: f64 = -14.0;
 pub const PEAK_CEILING_DBFS: f64 = -1.0;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Set by CI (`COZY_SCORE_BUILD`) to identify dev builds; never affects audio.
+pub const BUILD: Option<&str> = option_env!("COZY_SCORE_BUILD");
 
 /// Master settings to reuse from an earlier render (`--gain-from`).
 #[derive(Clone, Copy, Debug)]
@@ -52,6 +55,7 @@ pub struct Rendered {
 pub struct Cue {
     pub tool: &'static str,
     pub version: &'static str,
+    pub build: Option<&'static str>,
     pub seed: u64,
     pub feel: Feel,
     pub bpm: f64,
@@ -151,57 +155,61 @@ pub struct Chain<'a> {
     pub fade_out: f64,
 }
 
+/// Renders every section's part, sections in parallel. Each section gets
+/// its own synthesiser; a note's audio depends only on the note and seed.
 pub fn render_parts(
-    synth: &mut Synth,
+    seed: u64,
     vs: &[Voice],
-    pick: impl Fn(&Voice) -> bool,
+    pick: impl Fn(&Voice) -> bool + Sync,
     sections: usize,
     chain: &Chain,
 ) -> Vec<Option<Part>> {
-    (0..sections)
-        .map(|s| {
-            let mine: Vec<Voice> = vs
-                .iter()
-                .filter(|v| v.event.section == s && pick(v))
-                .filter(|v| v.amp != 0.0 && ((v.event.time * SR).round() as usize) < chain.len)
-                .cloned()
-                .collect();
-            let first = mine
-                .iter()
-                .map(|v| (v.event.time * SR).round() as usize)
-                .min()?;
-            let mut shifted = mine;
-            for v in shifted.iter_mut() {
-                v.event.time -= first as f64 / SR;
-            }
-            // Render once to find the extent, then mix into a local buffer.
-            let room = chain.len - first;
-            let bed = mix_voices(synth, shifted.iter(), room);
-            let last = bed
-                .dry
-                .l
-                .iter()
-                .zip(&bed.dry.r)
-                .rposition(|(l, r)| *l != 0.0 || *r != 0.0)
-                .unwrap_or(0);
-            let end = (last + 1 + chain.ir_len + (EQ_TAIL * SR) as usize).min(room);
-            let mut send = bed.send;
-            send.truncate(end);
-            let mut audio = Stereo {
-                l: bed.dry.l[..end].to_vec(),
-                r: bed.dry.r[..end].to_vec(),
-            };
-            chain
-                .reverb
-                .process_into(&send, WET, &mut audio.l, &mut audio.r);
-            apply_fades_at(&mut audio, first, chain.len, chain.fade_out);
-            master_eq(&mut audio);
-            Some(Part {
-                start: first,
-                audio,
+    par_map(sections, |s| {
+        let mut synth = Synth::new(seed);
+        let synth = &mut synth;
+        let mine: Vec<Voice> = vs
+            .iter()
+            .filter(|v| v.event.section == s && pick(v))
+            .filter(|v| v.amp != 0.0 && ((v.event.time * SR).round() as usize) < chain.len)
+            .cloned()
+            .collect();
+        // Render each note, then mix into a buffer just long enough for
+        // the notes, the reverb tail and the filters settling.
+        let rendered: Vec<(usize, Vec<f64>, Instrument)> = mine
+            .iter()
+            .map(|v| {
+                (
+                    (v.event.time * SR).round() as usize,
+                    synth.render(v),
+                    v.instrument,
+                )
             })
+            .collect();
+        let first = rendered.iter().map(|r| r.0).min()?;
+        let last = rendered
+            .iter()
+            .map(|r| r.0 + r.1.len())
+            .max()
+            .unwrap_or(first);
+        let end = (last - first + chain.ir_len + (EQ_TAIL * SR) as usize).min(chain.len - first);
+        let mut bed = Bed {
+            dry: Stereo::silent(end),
+            send: vec![0.0; end],
+        };
+        for (start, x, inst) in &rendered {
+            add_voice(&mut bed, start - first, x, *inst);
+        }
+        let mut audio = bed.dry;
+        chain
+            .reverb
+            .process_into(&bed.send, WET, &mut audio.l, &mut audio.r);
+        apply_fades_at(&mut audio, first, chain.len, chain.fade_out);
+        master_eq(&mut audio);
+        Some(Part {
+            start: first,
+            audio,
         })
-        .collect()
+    })
 }
 
 /// Master fades for a buffer that starts at absolute sample `start`.
@@ -237,6 +245,22 @@ pub fn sum_parts(dst: &mut Stereo, parts: &[Option<Part>], gains: &[f64]) {
     }
 }
 
+/// Adds `gain[s] * part[s]` for every section into `dst`, which holds the
+/// mix from absolute sample `from` on.
+fn sum_window(dst: &mut Stereo, from: usize, parts: &[Option<Part>], gains: &[f64]) {
+    let to = from + dst.len();
+    for (s, p) in parts.iter().enumerate() {
+        let Some(p) = p else { continue };
+        let a = p.start.max(from);
+        let b = (p.start + p.audio.len()).min(to);
+        let g = gains[s];
+        for i in a..b {
+            dst.l[i - from] += g * p.audio.l[i - p.start];
+            dst.r[i - from] += g * p.audio.r[i - p.start];
+        }
+    }
+}
+
 fn section_window(sp: &crate::arrange::SectionPlan, duration: f64) -> (usize, usize) {
     (
         (sp.start * SR).round() as usize,
@@ -259,21 +283,22 @@ pub fn calibrate_trims(arr: &Arrangement, parts: &[&[Option<Part>]], len: usize)
         .map(|s| target_relative_lu(s.kind.energy()))
         .collect();
     let mut trims = vec![0.0; n];
+    // Each section is measured on its own window of the mix, with a short
+    // pre-roll so the K-weighting filters settle.
+    let pre = (0.5 * SR) as usize;
     for _ in 0..8 {
         let gains: Vec<f64> = trims.iter().map(|t| db_to_gain(*t)).collect();
-        let mut mix = Stereo::silent(len);
-        for p in parts {
-            sum_parts(&mut mix, p, &gains);
-        }
-        let kp = k_power(&mix.channels(), SR);
-        let measured: Vec<Option<f64>> = arr
-            .sections
-            .iter()
-            .map(|sp| {
-                let (a, b) = section_window(sp, arr.duration);
-                gated(&kp, SR, a, b)
-            })
-            .collect();
+        let measured: Vec<Option<f64>> = par_map(n, |s| {
+            let sp = &arr.sections[s];
+            let (a, b) = section_window(sp, arr.duration);
+            let from = a.saturating_sub(pre);
+            let mut win = Stereo::silent(b.min(len) - from);
+            for p in parts {
+                sum_window(&mut win, from, p, &gains);
+            }
+            let kp = k_power(&win.channels(), SR);
+            gated(&kp, SR, a - from, b - from)
+        });
         let diffs: Vec<f64> = measured
             .iter()
             .zip(&targets)
@@ -326,7 +351,6 @@ pub fn render(req: &Request) -> Result<Rendered, Vec<String>> {
     let kinds: Vec<VideoType> = specs.iter().map(|s| s.kind).collect();
     let arr = arrange(&kinds, &timing, req.feel, req.seed);
     let n = arr.sections.len();
-    let mut synth = Synth::new(req.seed);
     let len = (arr.duration * SR).round() as usize;
     let fade_out = {
         let last = arr.sections.last().expect("sections");
@@ -345,8 +369,8 @@ pub fn render(req: &Request) -> Result<Rendered, Vec<String>> {
     // when the allow-lists change nothing.
     let all_res = resolve_sections(&arr, &Instrument::ALL, &vec![None; n]);
     let all_vs = voices(&arr.events, &all_res);
-    let lead_u = render_parts(&mut synth, &all_vs, |v| v.bus == Bus::Lead, n, &chain);
-    let rest_u = render_parts(&mut synth, &all_vs, |v| v.bus != Bus::Lead, n, &chain);
+    let lead_u = render_parts(req.seed, &all_vs, |v| v.bus == Bus::Lead, n, &chain);
+    let rest_u = render_parts(req.seed, &all_vs, |v| v.bus != Bus::Lead, n, &chain);
     let trims = calibrate_trims(&arr, &[&rest_u, &lead_u], len);
     let gains: Vec<f64> = trims.iter().map(|t| db_to_gain(*t)).collect();
 
@@ -368,8 +392,8 @@ pub fn render(req: &Request) -> Result<Rendered, Vec<String>> {
     } else {
         drop((lead_u, rest_u));
         (
-            render_parts(&mut synth, &vs, |v| v.bus == Bus::Lead, n, &chain),
-            render_parts(&mut synth, &vs, |v| v.bus != Bus::Lead, n, &chain),
+            render_parts(req.seed, &vs, |v| v.bus == Bus::Lead, n, &chain),
+            render_parts(req.seed, &vs, |v| v.bus != Bus::Lead, n, &chain),
         )
     };
     let mut no_melody = Stereo::silent(len);
@@ -417,7 +441,7 @@ pub fn render(req: &Request) -> Result<Rendered, Vec<String>> {
     let mut stems = Vec::new();
     if req.stems {
         for bus in Bus::all() {
-            let parts = render_parts(&mut synth, &vs, |v| v.bus == bus, n, &chain);
+            let parts = render_parts(req.seed, &vs, |v| v.bus == bus, n, &chain);
             let mut st = Stereo::silent(len);
             let g: Vec<f64> = gains.iter().map(|x| x * gain).collect();
             sum_parts(&mut st, &parts, &g);
@@ -499,6 +523,7 @@ pub fn render(req: &Request) -> Result<Rendered, Vec<String>> {
     let cue = Cue {
         tool: "cozy-score",
         version: VERSION,
+        build: BUILD,
         seed: req.seed,
         feel: req.feel,
         bpm,

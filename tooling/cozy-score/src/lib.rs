@@ -11,6 +11,7 @@ pub mod harmony;
 pub mod loudness;
 pub mod melody;
 pub mod mix;
+pub mod par;
 pub mod plan;
 pub mod render;
 pub mod resolve;
