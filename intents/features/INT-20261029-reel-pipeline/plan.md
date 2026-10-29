@@ -122,3 +122,13 @@ goes through `init`, `board`, `vo gen`, `take add`, `cut lock`,
 `score render`, `score pick`, `render --preview`, `render --final` and
 `check --youtube`. It asserts the duration, frame count, chapters,
 captions and loudness (−14 ± 0.5 LU).
+
+## Departures
+
+- **The fakes are committed scripts.** `cli/tests/fakes/whisper-cli` and
+  `cli/tests/fakes/pixellab` are files in the repo, and the test points
+  `pixelreel.yaml` at them. The plan had the tests write them.
+- **The master loop iterates.** The master adjusts gain and limiting in a
+  loop, and tightens the limiter's sample ceiling until the true peak
+  fits. A single pass came in up to 1 LU under target on peaky speech.
+- **`check --json`** was added, matching `board`, `status` and `cut show`.

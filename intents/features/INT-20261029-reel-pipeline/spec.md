@@ -370,9 +370,10 @@ named.
 - **Outputs:** `vo/<hash>-<n>.wav` (44.1 kHz) and
   `vo/<hash>-<n>.words.json` (word start and end times, built from the
   character alignment).
-- **Hash:** covers the text, voice id, model, voice settings and seed.
-  Files that already exist are never requested again unless `--force` is
-  given.
+- **Hash:** covers the text, voice id, model and voice settings. The take
+  number `n` in the file name is the request's seed, so the pair covers
+  the seed too. Files that already exist are never requested again unless
+  `--force` is given.
 - If a line belongs to a locked timeline, `vo gen` warns that the
   timeline must be re-locked.
 
