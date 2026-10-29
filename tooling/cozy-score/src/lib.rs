@@ -4,9 +4,17 @@
 //! (note events by role) -> instrument resolution (allow-lists, fallbacks) ->
 //! synthesis -> mix -> master -> encode.
 
+pub mod analysis;
+pub mod arrange;
+pub mod dsp;
 pub mod harmony;
+pub mod loudness;
 pub mod melody;
+pub mod mix;
 pub mod plan;
+pub mod render;
+pub mod resolve;
 pub mod rng;
+pub mod synth;
 pub mod timing;
 pub mod types;
