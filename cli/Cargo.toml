@@ -1,0 +1,32 @@
+[package]
+name = "pixelreel"
+version = "0.1.0"
+edition = "2021"
+description = "Turns a storyboard, talking-head takes, ElevenLabs lines, Pixel Lab scenes and outside animations into one video, scored with cozy-score"
+publish = false
+
+# Standalone crate: never part of a parent workspace.
+[workspace]
+
+[[bin]]
+name = "pixelreel"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "=0.22.1"
+clap = { version = "=4.6.7", features = ["derive"] }
+cozy-score = { path = "../tooling/cozy-score" }
+hound = "=3.5.1"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+serde_yaml = "=0.9.34"
+sha2 = "=0.11.1"
+
+[profile.test]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+codegen-units = 1

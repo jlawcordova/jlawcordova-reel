@@ -1,0 +1,14 @@
+#!/bin/sh
+# A stand-in for whisper.cpp's whisper-cli in tests: copies a prepared
+# transcript ($FAKE_WHISPER_DIR/<take>.json) to <-of>.json.
+in=""; of=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -f) in="$2"; shift 2 ;;
+    -of) of="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+name=$(basename "$in" .16k.wav)
+[ -f "$in" ] || { echo "no input $in" >&2; exit 1; }
+cp "$FAKE_WHISPER_DIR/$name.json" "$of.json"
