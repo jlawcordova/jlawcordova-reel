@@ -1,7 +1,10 @@
 //! Parsing and validation of the video plan.
 
-use crate::types::{Instrument, VideoType};
+use crate::events::{parse_events, EventSpec, ParseContext};
+use crate::harmony::{parse_key, Key};
+use crate::types::{Feel, Instrument, VideoType};
 use serde_json::Value;
+use std::path::Path;
 
 /// One section of the plan as the user wrote it (times in seconds).
 #[derive(Clone, Debug, PartialEq)]
@@ -234,14 +237,139 @@ pub fn fmt_time(t: f64) -> String {
     format!("{}:{:05.2}", m as u64, s)
 }
 
-/// Parses plan JSON text. Every problem is reported, not just the first.
+/// A whole plan: its sections, events and score settings.
+#[derive(Clone, Debug)]
+pub struct Plan {
+    pub sections: Vec<SectionSpec>,
+    pub events: Vec<EventSpec>,
+    pub feel: Option<Feel>,
+    pub bpm: Option<f64>,
+    pub key: Option<Key>,
+    pub fps: Option<f64>,
+    /// True for the original form, a bare array of sections.
+    pub legacy: bool,
+}
+
+/// Parses plan JSON text: the sections only (either form).
 pub fn parse_plan(text: &str) -> Result<Vec<SectionSpec>, Vec<String>> {
+    let cx = ParseContext {
+        base: Path::new("."),
+        document: None,
+        seed: 0,
+    };
+    parse_plan_with(text, &cx).map(|p| p.sections)
+}
+
+/// Parses plan JSON text, either a bare array of sections or an object
+/// `{ feel, bpm, key, fps, sections, events, notes }`. Every problem is
+/// reported, not just the first.
+pub fn parse_plan_with(text: &str, cx: &ParseContext) -> Result<Plan, Vec<String>> {
     let v: Value =
         serde_json::from_str(text).map_err(|e| vec![format!("plan is not valid JSON: {e}")])?;
-    let arr = match v {
-        Value::Array(a) => a,
-        _ => return Err(vec!["plan must be a JSON array of sections".into()]),
+    let mut errors = Vec::new();
+    let (arr, obj) = match &v {
+        Value::Array(a) => (a.clone(), None),
+        Value::Object(o) => {
+            for k in o.keys() {
+                if !matches!(
+                    k.as_str(),
+                    "feel" | "bpm" | "key" | "fps" | "sections" | "events" | "notes"
+                ) {
+                    errors.push(format!(
+                        "plan: unknown key \"{k}\" (expected feel, bpm, key, fps, sections, events, notes)"
+                    ));
+                }
+            }
+            match o.get("sections") {
+                Some(Value::Array(a)) => (a.clone(), Some(o)),
+                _ => {
+                    errors.push("plan: \"sections\" must be a list of sections".into());
+                    (Vec::new(), Some(o))
+                }
+            }
+        }
+        _ => {
+            return Err(vec![
+                "plan must be a JSON array of sections, or an object with \"sections\"".into(),
+            ])
+        }
     };
+    let sections = match parse_sections(&arr) {
+        Ok(s) => s,
+        Err(e) => {
+            errors.extend(e);
+            Vec::new()
+        }
+    };
+    let mut plan = Plan {
+        sections,
+        events: Vec::new(),
+        feel: None,
+        bpm: None,
+        key: None,
+        fps: None,
+        legacy: obj.is_none(),
+    };
+    if let Some(o) = obj {
+        match o.get("feel") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(s)) => match Feel::from_id(s) {
+                Some(f) => plan.feel = Some(f),
+                None => errors.push(format!(
+                    "plan: unknown feel \"{s}\" (valid: spring, summer, chip)"
+                )),
+            },
+            Some(x) => errors.push(format!("plan: feel must be a string, got {x}")),
+        }
+        match o.get("bpm") {
+            None | Some(Value::Null) => {}
+            Some(x) => match x.as_f64() {
+                Some(b) => match check_bpm(b) {
+                    Ok(b) => plan.bpm = Some(b),
+                    Err(e) => errors.push(format!("plan: {e}")),
+                },
+                None => errors.push(format!("plan: bpm must be a number, got {x}")),
+            },
+        }
+        match o.get("key") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(s)) => match parse_key(s) {
+                Ok(k) => plan.key = Some(k),
+                Err(e) => errors.push(format!("plan: {e}")),
+            },
+            Some(x) => errors.push(format!("plan: key must be a string like \"C\", got {x}")),
+        }
+        match o.get("fps") {
+            None | Some(Value::Null) => {}
+            Some(x) => match x.as_f64() {
+                Some(f) if (1.0..=1000.0).contains(&f) => plan.fps = Some(f),
+                _ => errors.push(format!(
+                    "plan: fps must be a number from 1 to 1000, got {x}"
+                )),
+            },
+        }
+        if let Some(ev) = o.get("events").filter(|v| !v.is_null()) {
+            plan.events = parse_events(ev, cx, &mut errors);
+        }
+    }
+    if errors.is_empty() {
+        Ok(plan)
+    } else {
+        Err(errors)
+    }
+}
+
+/// `--bpm` and the plan's `bpm`: 60 to 200.
+pub fn check_bpm(b: f64) -> Result<f64, String> {
+    if b.is_finite() && (60.0..=200.0).contains(&b) {
+        Ok(b)
+    } else {
+        Err(format!("bpm must be from 60 to 200, got {b}"))
+    }
+}
+
+/// Parses and validates the sections. Every problem is reported.
+pub fn parse_sections(arr: &[Value]) -> Result<Vec<SectionSpec>, Vec<String>> {
     if arr.is_empty() {
         return Err(vec!["plan has no sections".into()]);
     }
@@ -293,7 +421,7 @@ pub fn parse_plan(text: &str) -> Result<Vec<SectionSpec>, Vec<String>> {
 /// `--plan` accepts a path or inline JSON.
 pub fn load_plan_arg(arg: &str) -> Result<String, String> {
     let t = arg.trim_start();
-    if t.starts_with('[') {
+    if t.starts_with('[') || t.starts_with('{') {
         Ok(arg.to_string())
     } else {
         std::fs::read_to_string(arg).map_err(|e| format!("cannot read plan file \"{arg}\": {e}"))

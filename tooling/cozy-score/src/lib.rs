@@ -6,12 +6,15 @@
 
 pub mod analysis;
 pub mod arrange;
+pub mod detect;
 pub mod dsp;
+pub mod events;
 pub mod harmony;
 pub mod loudness;
 pub mod melody;
 pub mod mix;
 pub mod par;
+pub mod pixellab;
 pub mod plan;
 pub mod render;
 pub mod resolve;

@@ -54,7 +54,7 @@ impl Synth {
                     Art::Quarter => (2.2, 0.05),
                     Art::Strum { ring } => (ring, 0.05),
                     Art::Muted => (0.25, 0.04),
-                    Art::Normal | Art::Held => ((dur + 0.4).clamp(0.6, 2.2), 0.05),
+                    _ => ((dur + 0.4).clamp(0.6, 2.2), 0.05),
                 };
                 // Quantise ring length to 10 ms so notes share cache entries.
                 let n = samples((len * 100.0).round() / 100.0);
@@ -97,12 +97,211 @@ impl Synth {
             }
             Instrument::Shaker => shaker(&mut rng),
             Instrument::Rim => rim(&mut rng),
+            Instrument::Chip => {
+                let hold = match v.event.art {
+                    Art::Muted => 0.08,
+                    _ => dur.max(0.03),
+                };
+                let n = samples(hold);
+                self.cached((Instrument::Chip, m, n, 0), || chip(m, n))
+                    .to_vec()
+            }
+            Instrument::SynthPluck => {
+                let len = match v.event.art {
+                    Art::Strum { ring } => ring.clamp(0.6, 1.2),
+                    Art::Muted => 0.3,
+                    _ => 0.6,
+                };
+                let n = samples(len);
+                let tone = self.cached((Instrument::SynthPluck, m, n, 0), || {
+                    synth_pluck_tone(m, n, samples(0.04))
+                });
+                let mut out = tone.to_vec();
+                guitar_burst(&mut out, &mut rng);
+                ramp_ends(&mut out, samples(0.002), 0);
+                out
+            }
+            Instrument::Blip => self
+                .cached((Instrument::Blip, m, 0, 0), || blip(m))
+                .to_vec(),
+            Instrument::Clap => clap(&mut rng),
+            Instrument::Riser => riser(dur, v.event.art == Art::Reverse, &mut rng),
         };
+        match v.event.art {
+            Art::Glide => out = glide(&out, 40.0, 0.06),
+            Art::Swell => swell(&mut out, 0.12),
+            _ => {}
+        }
         for x in out.iter_mut() {
             *x *= v.amp;
         }
         out
     }
+}
+
+/// Plays `x` starting `cents` flat and gliding up to pitch over `time`
+/// seconds (linear-interpolated resampling).
+pub fn glide(x: &[f64], cents: f64, time: f64) -> Vec<f64> {
+    let n = x.len();
+    let mut out = vec![0.0; n];
+    let mut pos = 0.0f64;
+    for (i, o) in out.iter_mut().enumerate() {
+        let t = i as f64 / SR;
+        let g = (1.0 - t / time).max(0.0);
+        let k = pos as usize;
+        if k + 1 >= n {
+            break;
+        }
+        let fr = pos - k as f64;
+        *o = x[k] * (1.0 - fr) + x[k + 1] * fr;
+        pos += libm::exp2(-cents * g / 1200.0);
+    }
+    out
+}
+
+/// Removes the attack: the first `time` seconds rise linearly from silence.
+pub fn swell(x: &mut [f64], time: f64) {
+    let n = samples(time);
+    for (i, v) in x.iter_mut().take(n).enumerate() {
+        *v *= i as f64 / n as f64;
+    }
+}
+
+/// Chip lead: a band-limited 25% pulse, sum over k with f k <= 11 kHz of
+/// sin(pi k duty)/k e^{-k/14} sin(k phi); vibrato 0.3% at 6 Hz fading in over
+/// 0.12-0.22 s; 5 ms attack, 0.7 + 0.3 e^{-t/0.08}, 50 ms release.
+pub fn chip(m: i32, n_hold: usize) -> Vec<f64> {
+    let f = hz(m as f64);
+    let rel = samples(0.05);
+    let n = n_hold + rel;
+    let k_max = ((11000.0 / f).floor() as usize).max(1);
+    let coef: Vec<f64> = (1..=k_max)
+        .map(|k| {
+            let kf = k as f64;
+            libm::sin(PI * kf * 0.25) / kf * libm::exp(-kf / 14.0)
+        })
+        .collect();
+    let att = samples(0.005);
+    let mut out = vec![0.0; n];
+    let mut phase = 0.0f64;
+    for (i, x) in out.iter_mut().enumerate() {
+        let t = i as f64 / SR;
+        let (s1, c1) = libm::sincos(phase);
+        // sin(k phi) by the Chebyshev recurrence.
+        let (mut prev, mut cur) = (0.0, s1);
+        let mut v = 0.0;
+        for a in &coef {
+            v += a * cur;
+            let next = 2.0 * c1 * cur - prev;
+            prev = cur;
+            cur = next;
+        }
+        let mut env = 0.7 + 0.3 * libm::exp(-t / 0.08);
+        if i < att {
+            env *= i as f64 / att as f64;
+        }
+        if i >= n_hold {
+            env *= 1.0 - (i - n_hold) as f64 / rel as f64;
+        }
+        *x = env * v;
+        let fade = ((t - 0.12) / 0.10).clamp(0.0, 1.0);
+        let vib = 1.0 + 0.003 * fade * libm::sin(2.0 * PI * 6.0 * t);
+        phase += 2.0 * PI * f * vib / SR;
+        if phase > 2.0 * PI {
+            phase -= 2.0 * PI;
+        }
+    }
+    out
+}
+
+/// Synth pluck: the guitar's partials with a brighter decay,
+/// e^{-t(1.6 + 0.9k/2)}, and the given tail.
+pub fn synth_pluck_tone(m: i32, n: usize, tail: usize) -> Vec<f64> {
+    let f = hz(m as f64);
+    let mut out = vec![0.0; n];
+    let mut parts = Vec::new();
+    for k in 1..=13 {
+        let kf = k as f64;
+        let fk = f * kf * (1.0 + 0.0004 * kf * kf);
+        if fk > 12000.0 {
+            break;
+        }
+        parts.push(Partial {
+            f: fk,
+            amp: libm::fabs(libm::sin(PI * kf * 0.18)) / libm::pow(kf, 1.1),
+            decay: 1.6 + 0.9 * kf / 2.0,
+            phase: 0.0,
+        });
+    }
+    add_partials(&mut out, &parts);
+    ramp_ends(&mut out, 0, tail);
+    out
+}
+
+/// Blip: sin(phi) + 0.2 sin(2 phi), the frequency gliding up as
+/// f (0.72 + 0.28 (1 - e^{-t/0.018})); e^{-t/0.035}, 2 ms attack, 0.14 s.
+pub fn blip(m: i32) -> Vec<f64> {
+    let f = hz(m as f64);
+    let tau = 0.018;
+    let n = samples(0.14);
+    let mut out: Vec<f64> = (0..n)
+        .map(|i| {
+            let t = i as f64 / SR;
+            // The integral of the gliding frequency.
+            let phi = 2.0 * PI * f * (t - 0.28 * tau * (1.0 - libm::exp(-t / tau)));
+            (libm::sin(phi) + 0.2 * libm::sin(2.0 * phi)) * libm::exp(-t / 0.035)
+        })
+        .collect();
+    ramp_ends(&mut out, samples(0.002), samples(0.01));
+    out
+}
+
+/// Clap: uniform noise high-passed at 900 Hz and low-passed at 4.5 kHz, three
+/// bursts e^{-(t-d)/0.006} at d = 0, 11, 22 ms and a tail
+/// 0.6 e^{-(t-0.03)/0.07}; 0.25 s.
+pub fn clap(rng: &mut Rng) -> Vec<f64> {
+    let n = samples(0.25);
+    let mut hp = Biquad::highpass(900.0, SR);
+    let mut lp = Biquad::lowpass(4500.0, SR);
+    let mut out: Vec<f64> = (0..n)
+        .map(|i| {
+            let t = i as f64 / SR;
+            let mut env = 0.0;
+            for d in [0.0, 0.011, 0.022] {
+                if t >= d {
+                    env += libm::exp(-(t - d) / 0.006);
+                }
+            }
+            if t >= 0.03 {
+                env += 0.6 * libm::exp(-(t - 0.03) / 0.07);
+            }
+            lp.tick(hp.tick(rng.range(-1.0, 1.0))) * env
+        })
+        .collect();
+    ramp_ends(&mut out, samples(0.0005), samples(0.01));
+    out
+}
+
+/// Riser: uniform noise high-passed at 2.5 kHz, (t/dur)^2.2 over `dur` (then a
+/// 20 ms release), or reversed (1 - t/dur)^2 at 0.06/0.07 of the level.
+pub fn riser(dur: f64, reverse: bool, rng: &mut Rng) -> Vec<f64> {
+    let dur = dur.max(0.02);
+    let n_hold = samples(dur);
+    let rel = if reverse { 0 } else { samples(0.02) };
+    let mut hp = Biquad::highpass(2500.0, SR);
+    let mut out: Vec<f64> = (0..n_hold + rel)
+        .map(|i| {
+            let p = (i as f64 / n_hold as f64).min(1.0);
+            let env = if reverse {
+                libm::pow(1.0 - p, 2.0) * (0.06 / 0.07)
+            } else {
+                libm::pow(p, 2.2)
+            };
+            hp.tick(rng.range(-1.0, 1.0)) * env
+        })
+        .collect();
+    ramp_ends(&mut out, samples(0.002), rel.max(samples(0.005)));
+    out
 }
 
 /// Breathy flute: vibrato fading in from 0.18 s to 0.48 s at 5.2 Hz, depth
@@ -407,6 +606,13 @@ mod tests {
             kick_tone(),
             shaker(&mut r),
             rim(&mut r),
+            chip(76, samples(0.4)),
+            synth_pluck_tone(64, samples(0.6), samples(0.04)),
+            blip(88),
+            clap(&mut r),
+            riser(1.0, false, &mut r),
+            riser(0.8, true, &mut r),
+            glide(&mallet(81, samples(1.6), samples(0.03)), 40.0, 0.06),
         ] {
             assert!(buf.iter().all(|x| x.is_finite()));
             let p = peak(&buf);

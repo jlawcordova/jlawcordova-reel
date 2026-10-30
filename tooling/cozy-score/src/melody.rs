@@ -1,7 +1,7 @@
 //! Melody generator: phrases built from 1-bar rhythm cells, chord tones on
 //! strong beats, mostly stepwise motion, A A' phrase pairs.
 
-use crate::harmony::{chord_tones, in_scale, Chord};
+use crate::harmony::{chord_tones, in_scale_of, Chord};
 use crate::rng::Rng;
 
 /// A melody note; `beat` counts from the first bar of the melody.
@@ -51,6 +51,7 @@ struct Search<'a> {
     slots: &'a [Slot],
     lo: i32,
     hi: i32,
+    tonic: i32,
     rng: &'a mut Rng,
     budget: u32,
 }
@@ -61,7 +62,9 @@ impl Search<'_> {
         let pool: Vec<i32> = if s.must_chord {
             chord_tones(s.chord, self.lo, self.hi)
         } else {
-            (self.lo..=self.hi).filter(|&m| in_scale(m)).collect()
+            (self.lo..=self.hi)
+                .filter(|&m| in_scale_of(self.tonic, m))
+                .collect()
         };
         let mut ok: Vec<(i32, f64)> = Vec::new();
         for m in pool {
@@ -70,8 +73,8 @@ impl Search<'_> {
             }
             let w = match prev {
                 None => {
-                    // Start mid-range.
-                    let d = (m - 79).abs();
+                    // Start mid-range (G5 in the D major range 74-88).
+                    let d = (m - (self.lo + 5)).abs();
                     if d <= 4 {
                         4.0
                     } else {
@@ -199,6 +202,18 @@ pub fn generate(
     hi: i32,
     end_on_root: bool,
 ) -> Vec<MelNote> {
+    generate_in(rng, chords, lo, hi, end_on_root, 2)
+}
+
+/// [`generate`] in the major key on `tonic` (a pitch class).
+pub fn generate_in(
+    rng: &mut Rng,
+    chords: &[Chord],
+    lo: i32,
+    hi: i32,
+    end_on_root: bool,
+    tonic: i32,
+) -> Vec<MelNote> {
     let bars = chords.len();
     if bars == 0 {
         return Vec::new();
@@ -249,6 +264,7 @@ pub fn generate(
             slots: &run,
             lo,
             hi,
+            tonic,
             rng,
             budget: 50_000,
         };
@@ -284,7 +300,18 @@ pub fn generate(
 /// A 3-note motif reply over `chord`, starting at `beat` (eighths, then a
 /// held note).
 pub fn motif_reply(rng: &mut Rng, chord: Chord, beat: f64) -> Vec<MelNote> {
-    let tones = chord_tones(chord, 76, 86);
+    motif_reply_in(rng, chord, beat, 2, 0)
+}
+
+/// [`motif_reply`] in the key on `tonic`, its range moved by `off`.
+pub fn motif_reply_in(
+    rng: &mut Rng,
+    chord: Chord,
+    beat: f64,
+    tonic: i32,
+    off: i32,
+) -> Vec<MelNote> {
+    let tones = chord_tones(chord, 76 + off, 86 + off);
     let start = *rng.pick(&tones);
     let shape: [i32; 3] = *rng.pick(&[[0, 2, 0], [0, -1, -3], [0, 2, 4], [0, -2, 0], [0, 1, 0]]);
     let mut notes = Vec::new();
@@ -298,7 +325,7 @@ pub fn motif_reply(rng: &mut Rng, chord: Chord, beat: f64) -> Vec<MelNote> {
             if k == 2 {
                 chord.is_chord_tone(x)
             } else {
-                in_scale(x)
+                in_scale_of(tonic, x)
             }
         });
         notes.push(MelNote {
@@ -326,18 +353,24 @@ fn nearest(target: i32, ok: impl Fn(i32) -> bool) -> i32 {
 
 /// Long soft notes: one chord tone held per selected bar.
 pub fn long_notes(rng: &mut Rng, chords: &[Chord], every: usize) -> Vec<MelNote> {
+    long_notes_in(rng, chords, every, 74)
+}
+
+/// [`long_notes`] in the range [lo, lo + 9] (74-83 in D major).
+pub fn long_notes_in(rng: &mut Rng, chords: &[Chord], every: usize, lo: i32) -> Vec<MelNote> {
+    let hi = lo + 9;
     let mut out = Vec::new();
-    let mut prev = 78;
+    let mut prev = lo + 4;
     for (b, &c) in chords.iter().enumerate() {
         if b % every != every - 1 {
             continue;
         }
-        let tones: Vec<i32> = chord_tones(c, 74, 83)
+        let tones: Vec<i32> = chord_tones(c, lo, hi)
             .into_iter()
             .filter(|m| (m - prev).abs() <= 5)
             .collect();
         let tones = if tones.is_empty() {
-            chord_tones(c, 74, 83)
+            chord_tones(c, lo, hi)
         } else {
             tones
         };
@@ -356,7 +389,7 @@ pub fn long_notes(rng: &mut Rng, chords: &[Chord], every: usize) -> Vec<MelNote>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harmony::{chords_for, chords_with_ending, Loop};
+    use crate::harmony::{chords_for, chords_with_ending, in_scale, Loop};
 
     fn check(notes: &[MelNote], chords: &[Chord], lo: i32, hi: i32) {
         for n in notes {
@@ -406,6 +439,31 @@ mod tests {
                     let mut r = Rng::new(seed).fork(&format!("{lp:?}{bars}"));
                     let notes = generate(&mut r, &chords, 74, 88, false);
                     check(&notes, &chords, 74, 88);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn melodies_over_seventh_chords_in_c() {
+        use crate::harmony::{in_scale_of, Loop};
+        for seed in 0..20u64 {
+            for lp in Loop::CHIP {
+                for bars in [2usize, 4, 8] {
+                    let chords = chords_for(lp, bars);
+                    let notes = generate_in(&mut Rng::new(seed), &chords, 72, 88, false, 0);
+                    for n in &notes {
+                        assert!(
+                            (72..=88).contains(&n.midi) && in_scale_of(0, n.midi),
+                            "{n:?}"
+                        );
+                        let bar = (n.beat / 4.0) as usize;
+                        if is_strong(n.beat - (bar * 4) as f64) {
+                            assert!(chords[bar].is_chord_tone(n.midi), "{n:?}");
+                        }
+                    }
+                    let total: f64 = notes.iter().map(|n| n.len).sum();
+                    assert_eq!(total, (bars * 4) as f64);
                 }
             }
         }

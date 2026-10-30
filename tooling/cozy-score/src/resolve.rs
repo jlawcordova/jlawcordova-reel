@@ -2,7 +2,7 @@
 //! its fallback list, per section, and turns note events into voices.
 
 use crate::arrange::{Arrangement, NoteEvent};
-use crate::types::{Instrument, Role};
+use crate::types::{Feel, Instrument, Role};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -30,14 +30,24 @@ impl Bus {
     }
 }
 
-/// Preferred instrument first, then the fallbacks in order.
+/// Preferred instrument first, then the fallbacks in order (spring and
+/// summer).
 pub fn candidates(role: Role, preferred_bass: Instrument) -> Vec<Instrument> {
+    candidates_in(role, preferred_bass, Feel::Spring)
+}
+
+/// Preferred instrument first, then the fallbacks in order, in `feel`.
+pub fn candidates_in(role: Role, preferred_bass: Instrument, feel: Feel) -> Vec<Instrument> {
     use Instrument::*;
+    let chip = feel == Feel::Chip;
     match role {
-        Role::Lead => vec![Flute, Mallet, Guitar],
+        Role::Lead if chip => vec![Chip, Flute, Mallet, Guitar],
+        Role::Lead => vec![Flute, Chip, Mallet, Guitar],
+        Role::Motif if chip => vec![SynthPluck, Mallet, Flute, Guitar],
         Role::Motif => vec![Mallet, Flute, Guitar],
         Role::ChordHits => vec![Mallet, Guitar],
-        Role::Picking => vec![Guitar, Mallet],
+        Role::Picking if chip => vec![SynthPluck, Guitar, Mallet],
+        Role::Picking => vec![Guitar, SynthPluck, Mallet],
         Role::Pad => vec![Pad],
         Role::Bass => {
             if preferred_bass == SoftBass {
@@ -48,7 +58,10 @@ pub fn candidates(role: Role, preferred_bass: Instrument) -> Vec<Instrument> {
         }
         Role::Kick => vec![Kick],
         Role::Shaker => vec![Shaker],
-        Role::Rim => vec![Rim],
+        Role::Backbeat if chip => vec![Clap, Rim],
+        Role::Backbeat => vec![Rim, Clap],
+        Role::Fx => vec![Blip, Mallet, Shaker],
+        Role::Riser => vec![Riser],
     }
 }
 
@@ -72,8 +85,41 @@ pub fn nominal(role: Role, inst: Instrument) -> f64 {
         (Role::Bass, SoftBass) => 0.36,
         (Role::Kick, Kick) => 0.5,
         (Role::Shaker, Shaker) => 0.18,
-        (Role::Rim, Rim) => 0.17,
-        _ => 0.0,
+        (Role::Backbeat, Rim) => 0.17,
+        (Role::Lead, Chip) => 0.14,
+        (Role::Motif, SynthPluck) => 0.22,
+        (Role::Motif, Chip) => 0.12,
+        (Role::Picking, SynthPluck) => 0.28,
+        (Role::Backbeat, Clap) => 0.3,
+        (Role::Fx, Blip) => 0.2,
+        // Mallet as fx: short notes.
+        (Role::Fx, Mallet) => 0.12,
+        (Role::Fx, Shaker) => 0.18,
+        (Role::Fx, Clap) => 0.3,
+        (Role::Riser, Riser) => 0.07,
+        // An event asked for this instrument outright.
+        _ => base_level(inst),
+    }
+}
+
+/// An instrument's level when it plays a role outside its table.
+pub fn base_level(inst: Instrument) -> f64 {
+    use Instrument::*;
+    match inst {
+        Flute => 0.22,
+        Guitar => 0.2,
+        Mallet => 0.16,
+        Pad => 0.13,
+        HeavyBass => 0.5,
+        SoftBass => 0.36,
+        Kick => 0.5,
+        Shaker => 0.18,
+        Rim => 0.17,
+        Chip => 0.14,
+        SynthPluck => 0.24,
+        Blip => 0.2,
+        Clap => 0.3,
+        Riser => 0.07,
     }
 }
 
@@ -156,7 +202,7 @@ pub fn resolve_sections(
             let mut kept_w = 0.0;
             let mut total_w = 0.0;
             for &role in &roles_used {
-                let cands = candidates(role, sp.preferred_bass);
+                let cands = candidates_in(role, sp.preferred_bass, sp.feel);
                 let inst = cands.iter().copied().find(|c| allowed.contains(c));
                 let status = match inst {
                     Some(i) if i == cands[0] => "preferred",
@@ -257,4 +303,23 @@ pub fn summary_lines(arr: &Arrangement, res: &[SectionResolution]) -> Vec<String
         }
     }
     out
+}
+
+/// The instrument an event's note plays in a section that allows
+/// `allowed`: the one it asks for when allowed, else its role's fallbacks.
+pub fn resolve_event(
+    role: Role,
+    prefer: Option<Instrument>,
+    allowed: &[Instrument],
+    feel: Feel,
+    preferred_bass: Instrument,
+) -> Option<Instrument> {
+    if let Some(p) = prefer {
+        if allowed.contains(&p) {
+            return Some(p);
+        }
+    }
+    candidates_in(role, preferred_bass, feel)
+        .into_iter()
+        .find(|c| allowed.contains(c))
 }
